@@ -6,7 +6,7 @@ It was built for the University of Southampton Japanese Society (SUJAS) games ni
 
 | Players' phones | Station host | Game setup | Projector |
 |---|---|---|---|
-| ![Leaderboard](docs/board.png) | ![Host panel](docs/host.png) | ![Setup](docs/setup.png) | ![TV mode](docs/tv.png) |
+| ![Leaderboard](board.png) | ![Host panel](host.png) | ![Setup](setup.png) | ![TV mode](tv.png) |
 
 ## Features
 
