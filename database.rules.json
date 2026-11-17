@@ -1,0 +1,15 @@
+{
+  "rules": {
+    ".read": true,
+    "players": {
+      ".write": "auth != null",
+      "$pid": {
+        "coins": { ".validate": "newData.isNumber()" },
+        "name": { ".validate": "newData.isString() && newData.val().length < 40" }
+      }
+    },
+    "log": { ".write": "auth != null" },
+    "settings": { ".write": "auth != null" },
+    "config": { ".write": "auth != null" }
+  }
+}
