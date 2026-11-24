@@ -167,6 +167,13 @@ details.rules h4 small{font-family:var(--body);color:var(--grey);margin-left:var
 .warn,.ended{color:var(--accent);margin-top:var(--s3)}
 .ended{margin-top:0}
 
+/* join and ticket bits */
+.join{margin-bottom:var(--s5)}
+.join .intro{margin-bottom:var(--s3)}
+.check{display:flex;align-items:center;gap:var(--s2);min-height:44px;margin-top:var(--s2);cursor:pointer}
+.check input{width:24px;height:24px;margin:0;accent-color:var(--accent)}
+.tags{display:block;color:var(--grey)}
+
 /* forms */
 .field{display:flex;gap:var(--s2);margin:var(--s2) 0}
 .field input,textarea,.minput,.lab input,.lab select,.lab textarea{display:block;width:100%;min-height:48px;padding:var(--s2) var(--s3);border:1px solid var(--grey);border-radius:var(--radius);background:var(--paper)}

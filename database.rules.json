@@ -1,15 +1,33 @@
 {
   "rules": {
-    ".read": true,
     "players": {
-      ".write": "auth != null",
+      ".read": true,
+      ".write": "auth != null && auth.token.firebase.sign_in_provider == 'password' && auth.token.email == 'host@sujas.games'",
       "$pid": {
+        ".write": "auth != null && auth.token.firebase.sign_in_provider == 'google.com' && $pid == auth.uid && !data.exists() && newData.child('uid').val() == auth.uid && ((root.child('tickets').child(auth.token.email.toLowerCase().replace('.', ',')).exists() && newData.child('ticket').val() == true && newData.child('coins').val() == root.child('config/ticketCoins').val()) || (!root.child('tickets').child(auth.token.email.toLowerCase().replace('.', ',')).exists() && !newData.child('ticket').exists() && newData.child('coins').val() == root.child('config/startCoins').val()))",
         "coins": { ".validate": "newData.isNumber()" },
-        "name": { ".validate": "newData.isString() && newData.val().length < 40" }
+        "name": { ".validate": "newData.isString() && newData.val().length > 0 && newData.val().length < 40" },
+        "ticket": { ".validate": "newData.isBoolean()" }
       }
     },
-    "log": { ".write": "auth != null" },
-    "settings": { ".write": "auth != null" },
-    "config": { ".write": "auth != null" }
+    "log": {
+      ".read": true,
+      ".write": "auth != null && auth.token.firebase.sign_in_provider == 'password' && auth.token.email == 'host@sujas.games'"
+    },
+    "settings": {
+      ".read": true,
+      ".write": "auth != null && auth.token.firebase.sign_in_provider == 'password' && auth.token.email == 'host@sujas.games'"
+    },
+    "config": {
+      ".read": true,
+      ".write": "auth != null && auth.token.firebase.sign_in_provider == 'password' && auth.token.email == 'host@sujas.games'"
+    },
+    "tickets": {
+      ".read": "auth != null && auth.token.firebase.sign_in_provider == 'password' && auth.token.email == 'host@sujas.games'",
+      ".write": "auth != null && auth.token.firebase.sign_in_provider == 'password' && auth.token.email == 'host@sujas.games'",
+      "$key": {
+        ".read": "auth != null && auth.token.email.toLowerCase().replace('.', ',') == $key"
+      }
+    }
   }
 }

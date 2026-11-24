@@ -1,12 +1,13 @@
 import {FIREBASE_CONFIG} from './firebase-config.js';
-import {firebaseStore, localStore, inc, LS} from './store.js';
+import {firebaseStore, localStore, inc, LS, emailKey} from './store.js';
 
 // used until the host saves their own setup
 const DEFAULT_CONFIG = {
   title: 'SUJAS Games Night',
   subtitle: 'ゲームナイト・コイン',
   startCoins: 100,
-  brokePolicy: 'warn',
+  ticketCoins: 200,
+  brokePolicy: 'allow',
   games: [
     {id:'indian', name:'Indian Poker', sub:'インディアンポーカー', kind:'pot', fee:5, notes:['Same number → rock paper scissors']},
     {id:'poker', name:'Poker', sub:'ポーカー', kind:'bank'},
@@ -20,7 +21,7 @@ const KINDS = {
   ranked: {label:'Placings & prizes', help:'Everyone pays the entry fee and prizes go by finishing place. Use a fee of 0 for a free prize game.'},
   bank:   {label:'Chips (buy in / cash out)', help:'Players swap coins for chips at the table and cash out when they leave. 1 coin = 1 chip.'},
 };
-const BROKE = {warn:'Warn the host but allow', block:'Block them from joining', allow:'Allow silently'};
+const BROKE = {allow:'Let them go into debt (minus coins)', warn:'Warn the host, then allow debt', block:'Block them from joining'};
 const ORD = ['1st','2nd','3rd','4th','5th','6th','7th','8th','9th','10th','11th','12th'];
 
 // ===== helpers =====
@@ -51,15 +52,17 @@ let S = {players:{}, log:{}, settings:{}, config:null};
 let store = null, user = null, loaded = false, lastMe = {};
 const blankSt = () => ({sel:[], order:[], step:'pick', q:''});
 const ui = {
-  me: LS.get('gn-me', null),
   search: '',
   tab: LS.get('gn-tab', null),
   st: LS.get('gn-st', {}),
-  pokerAmt: '', newName: '', bulk: '', loginErr: '',
-  ev: null,
+  pokerAmt: '', newName: '', bulk: '', loginErr: '', addTicket: false,
+  ev: null, ticketsText: null,
+  joinName: null, joinTicket: undefined, joinErr: '',
 };
 const saveDraft = () => { LS.set('gn-st', ui.st); LS.set('gn-tab', ui.tab); };
 const stOf = id => (ui.st[id] ??= blankSt());
+const isHost = () => user?.role === 'host';
+const meId = () => user?.role === 'player' ? user.uid : null;
 
 // config from the database, falling back to the defaults
 function cfg(){
@@ -98,9 +101,11 @@ const pname = id => S.players[id]?.name || '(removed)';
 const historyOf = pid => logList().filter(e => e.deltas && e.deltas[pid] != null);
 const deltaText = d => Object.entries(d || {}).map(([pid, n]) => `${esc(pname(pid))} ${sgn(n)}`).join(', ');
 
+const parseEmails = t => [...new Set((String(t || '').toLowerCase().match(/[^\s,;<>()"']+@[^\s,;<>()"']+\.[a-z]{2,}/g) || []))];
+
 // ===== writes =====
-async function transact(g, label, deltas, extra = {}){
-  const id = store.newId('log'), upd = {};
+async function transact(g, label, deltas, extra = {}, more = {}){
+  const id = store.newId('log'), upd = {...more};
   for (const [pid, d] of Object.entries(deltas)) if (d) upd[`players/${pid}/coins`] = inc(d);
   upd[`log/${id}`] = {ts: Date.now(), station: g.id, stationName: g.name, label, deltas, by: user?.email || '', ...extra};
   await store.write(upd);
@@ -145,8 +150,8 @@ function header(active){
     ${store?.demo ? '<p class="demo">Demo mode: data is only saved in this browser.</p>' : ''}`;
 }
 const ordinal = n => n + (n % 100 >= 11 && n % 100 <= 13 ? 'th' : ['th','st','nd','rd'][n % 10] || 'th');
-const row = p => `<button class="row ${p.id === ui.me ? 'me' : ''}" data-act="player" data-arg="${p.id}">
-  <span class="rk ${p.rank <= 3 ? 'top' : ''}">${p.rank}</span><span class="nm">${esc(p.name)}${p.id === ui.me ? '<i class="you">you</i>' : ''}</span><span class="cn">${p.coins}</span></button>`;
+const row = p => `<button class="row ${p.id === meId() ? 'me' : ''}" data-act="player" data-arg="${p.id}">
+  <span class="rk ${p.rank <= 3 ? 'top' : ''}">${p.rank}</span><span class="nm">${esc(p.name)}${p.id === meId() ? '<i class="you">you</i>' : ''}</span><span class="cn">${p.coins}</span></button>`;
 
 function podium(list){
   const top = list.slice(0, 3);
@@ -157,15 +162,37 @@ function podium(list){
 }
 
 const rulesCard = () => `<details class="rules"><summary>Game rules <span lang="ja">ルール</span></summary>
-  <p>Everyone starts with ${cfg().startCoins} coins. Most coins at the end wins.</p>
+  <p>Everyone starts with ${cfg().startCoins} coins, or ${cfg().ticketCoins} with a ticket. You can go into minus. Most coins at the end wins.</p>
   ${games().map(g => `<h4>${esc(g.name)} <small>${esc(g.sub || '')}</small></h4>${rulesOf(g).map(r => `<p>${esc(r)}</p>`).join('')}`).join('')}</details>`;
+
+// top of the board: sign in, then join, then your coins
+function joinHtml(){
+  if (!store || !loaded) return '';
+  if (isHost()) return `<p class="intro">You’re logged in as a host. Players join on their own phones.</p>`;
+  if (!user) return `<section class="join"><p class="intro">Sign in with Google to join and follow your coins.<span lang="ja">Googleでログインして参加してね</span></p>
+    <button class="btn" data-act="google">Sign in with Google</button></section>`;
+  // signed-in player with no record yet: check the ticket list once
+  if (ui.joinTicket === undefined){
+    ui.joinTicket = null;
+    store.read('tickets/' + emailKey(user.email)).then(v => { ui.joinTicket = !!v; }).catch(() => { ui.joinTicket = false; }).finally(schedule);
+  }
+  if (ui.joinName === null) ui.joinName = (user.name || '').slice(0, 39);
+  const c = cfg(), t = ui.joinTicket;
+  const note = t === null ? 'Checking your ticket…'
+    : t ? `Ticket found for ${user.email}. You start with ${c.ticketCoins} coins.`
+    : `No ticket found for ${user.email}. You start with ${c.startCoins} coins. Bought one? Tell a host and they’ll add the rest.`;
+  return `<section class="join"><h2 class="me-name">Join the game</h2>
+    <form id="join"><label class="lab">Your name on the leaderboard<input id="join-name" data-bind="joinName" value="${esc(ui.joinName)}" maxlength="39" autocomplete="nickname"></label>
+    <p class="hint">${esc(note)}</p>${ui.joinErr ? `<p class="warn">${esc(ui.joinErr)}</p>` : ''}
+    <div class="bar"><button class="btn" type="submit" ${t === null ? 'disabled' : ''}>Join with ${t ? c.ticketCoins : c.startCoins} coins</button></div></form></section>`;
+}
 
 function viewBoard(){
   const list = ranked();
-  const me = list.find(p => p.id === ui.me);
+  const me = list.find(p => p.id === meId());
   const q = ui.search.trim().toLowerCase();
   const shown = q ? list.filter(p => String(p.name).toLowerCase().includes(q)) : list;
-  let meHtml = `<p class="intro">Tap your name to follow your coins.<span lang="ja">自分の名前をタップしてね</span></p>`;
+  let meHtml = joinHtml();
   if (me){
     const h = historyOf(me.id).filter(e => !e.undone).slice(0, 4);
     // flash the number when it changes
@@ -180,7 +207,8 @@ function viewBoard(){
     <h2 class="sect">Leaderboard <span lang="ja">ランキング</span></h2>
     <input id="search" class="search" data-bind="search" data-live placeholder="Search names" value="${esc(ui.search)}" autocomplete="off">
     <div class="board">${shown.map(row).join('') || `<div class="empty">${loaded ? 'No players yet' : 'Loading…'}</div>`}</div>
-    ${rulesCard()}`;
+    ${rulesCard()}
+    ${user && !isHost() ? `<p class="foot">Signed in as ${esc(user.email)}. <a href="#" data-act="logout">Sign out</a></p>` : ''}`;
 }
 
 function viewTV(){
@@ -196,7 +224,8 @@ function viewTV(){
 
 function viewHost(){
   if (!store) return header('host') + '<div class="empty">Connecting…</div>';
-  if (!user) return `${header('host')}<div class="panel"><h2>Host login</h2><div class="jp">Station hosts only</div>
+  if (!isHost()) return `${header('host')}<div class="panel"><h2>Host login</h2><div class="jp">Station hosts only</div>
+    ${user ? `<p class="hint">You’re signed in with Google as a player. Logging in here switches this phone to the host account.</p>` : ''}
     <form id="login"><div class="field"><input id="lemail" type="email" placeholder="Email" autocomplete="username"></div>
     <div class="field"><input id="lpw" type="password" placeholder="Password" autocomplete="current-password"></div>
     ${ui.loginErr ? `<div class="warn">${esc(ui.loginErr)}</div>` : ''}
@@ -266,7 +295,7 @@ function viewBank(g){
   return `${head(g)}<p class="sel">Chips currently on the table: <b>${table}</b></p>
     <p class="sel">1. Pick a player</p>${picker(g, 1)}
     <p class="sel">2. Amount${pid ? ` for <b>${esc(pname(pid))}</b> (has ${S.players[pid]?.coins ?? 0} coins)` : ''}</p>
-    <div class="field"><input id="pamt" type="number" inputmode="numeric" min="1" data-bind="pokerAmt" data-live value="${esc(ui.pokerAmt)}" placeholder="e.g. 30"></div>
+    <div class="field"><input id="pamt" type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="off" data-bind="pokerAmt" data-live value="${esc(ui.pokerAmt)}" placeholder="e.g. 30"></div>
     <div class="bar"><button class="btn" data-act="bank" data-arg="${g.id}|in" ${ok ? '' : 'disabled'}>Buy in (coins → chips)</button>
     <button class="btn dark" data-act="bank" data-arg="${g.id}|out" ${ok ? '' : 'disabled'}>Cash out (chips → coins)</button></div>
     ${recent.length ? `<h3>Recent</h3>${recent.map(logRow).join('')}` : ''}`;
@@ -274,12 +303,15 @@ function viewBank(g){
 
 function viewPlayers(){
   const list = ranked().sort((a, b) => String(a.name).localeCompare(b.name));
-  return `<h2>Players</h2><div class="jp">${list.length} players. New players start with ${cfg().startCoins} coins.</div>
+  const c = cfg();
+  return `<h2>Players</h2><div class="jp">${list.length} players. Players usually join themselves with Google. Add people here who can’t.</div>
     <form id="addone"><div class="field"><input id="newname" data-bind="newName" value="${esc(ui.newName)}" placeholder="Name" autocomplete="off"><button class="btn small" type="submit">Add</button></div></form>
+    <label class="check"><input type="checkbox" id="addticket" data-bind="addTicket" ${ui.addTicket ? 'checked' : ''}> Has a ticket (starts with ${c.ticketCoins}, not ${c.startCoins})</label>
     <details><summary class="hint">Add many at once</summary><textarea id="bulk" data-bind="bulk" placeholder="One name per line">${esc(ui.bulk)}</textarea>
     <div class="bar"><button class="btn small" data-act="bulkadd">Add all</button></div></details>
-    <div class="plist">${list.map(p => `<div class="pr"><span class="nm">${esc(p.name)}</span><b>${p.coins}</b>
-      <span class="acts"><button class="btn ghost small" data-act="adjust" data-arg="${p.id}">Adjust</button>
+    <div class="plist">${list.map(p => `<div class="pr"><span class="nm">${esc(p.name)}<small class="tags">${[p.ticket ? 'ticket' : '', p.uid ? 'Google' : 'added by host'].filter(Boolean).join(', ')}</small></span><b>${p.coins}</b>
+      <span class="acts">${p.ticket ? '' : `<button class="btn ghost small" data-act="ticket" data-arg="${p.id}">Bought ticket</button>`}
+      <button class="btn ghost small" data-act="adjust" data-arg="${p.id}">Adjust</button>
       <button class="btn ghost small" data-act="rename" data-arg="${p.id}">Rename</button>
       <button class="btn ghost small" data-act="delete" data-arg="${p.id}">Remove</button></span></div>`).join('')}</div>`;
 }
@@ -302,18 +334,30 @@ function balance(g){
 
 function viewSetup(){
   const c = cfg(), gs = c.games;
-  ui.ev ??= {title: c.title, subtitle: c.subtitle, startCoins: String(c.startCoins), brokePolicy: c.brokePolicy};
+  ui.ev ??= {title: c.title, subtitle: c.subtitle, startCoins: String(c.startCoins), ticketCoins: String(c.ticketCoins), brokePolicy: c.brokePolicy};
+  // load the private ticket list once per visit to this tab
+  if (ui.ticketsText === null){
+    ui.ticketsText = '';
+    store.read('tickets').then(t => { ui.ticketsText = Object.keys(t || {}).map(k => k.replace(/,/g, '.')).sort().join('\n'); schedule(); }).catch(() => {});
+  }
+  const ticketCount = parseEmails(ui.ticketsText).length;
   return `<h2>Setup</h2><div class="jp">Event settings and games</div>
     ${!S.config?.games ? '<div class="warn">You’re using the built-in games. Saving any change here creates your own setup.</div>' : ''}
     <h3>Event</h3>
     <form id="eventform">
       <label class="lab">Title<input id="e-title" data-bind="ev.title" value="${esc(ui.ev.title)}"></label>
       <label class="lab">Subtitle<input id="e-sub" data-bind="ev.subtitle" value="${esc(ui.ev.subtitle)}"></label>
-      <label class="lab">Starting coins (for new players)<input id="e-start" type="number" min="0" inputmode="numeric" data-bind="ev.startCoins" value="${esc(ui.ev.startCoins)}"></label>
+      <label class="lab">Starting coins without a ticket<input id="e-start" type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="off" data-bind="ev.startCoins" value="${esc(ui.ev.startCoins)}"></label>
+      <label class="lab">Starting coins with a ticket<input id="e-tstart" type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="off" data-bind="ev.ticketCoins" value="${esc(ui.ev.ticketCoins)}"></label>
       <label class="lab">If a player can’t afford a game
         <select id="e-broke" data-bind="ev.brokePolicy">${Object.entries(BROKE).map(([k, l]) => `<option value="${k}" ${ui.ev.brokePolicy === k ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
       <div class="bar"><button class="btn small" type="submit">Save event settings</button></div>
     </form>
+    <h3>Ticket holders</h3>
+    <p class="hint">Paste the email of everyone who bought a ticket. Anyone who signs in with one of these Google accounts starts with ${c.ticketCoins} coins. Only hosts can see this list.</p>
+    <label class="lab">Emails, one per line<textarea id="tickets" data-bind="ticketsText" data-live placeholder="name@gmail.com">${esc(ui.ticketsText)}</textarea></label>
+    <p class="hint">${ticketCount} ${ticketCount === 1 ? 'email' : 'emails'} on the list.</p>
+    <div class="bar"><button class="btn small" data-act="savetickets">Save ticket list</button></div>
     <h3>Games</h3>
     <div class="glist">${gs.map((g, i) => `<div class="gr"><div class="gi"><b>${esc(g.name)}</b>
       <small>${KINDS[g.kind].label}${g.fee ? `, fee ${g.fee}` : ''}${g.kind === 'ranked' ? `, prizes ${g.payouts.join('/')}` : ''}</small>
@@ -404,13 +448,13 @@ const ACT = {
   async mok(){ const fn = modalOk; if (!fn) return; const keep = await fn(); if (keep !== true) closeModal(); },
   player(id){
     const p = S.players[id]; if (!p) return;
-    const h = historyOf(id), isMe = ui.me === id;
+    const h = historyOf(id);
     openModal(`<h3>${esc(p.name)}</h3><p class="m-coins">${p.coins} coins</p>
       ${h.length ? `<table>${h.slice(0, 30).map(e => `<tr style="${e.undone ? 'opacity:.4;text-decoration:line-through' : ''}"><td>${esc(e.label)}<br><small style="color:var(--muted)">${fmtT(e.ts)}</small></td><td>${sgn(e.deltas[id])}</td></tr>`).join('')}</table>` : '<p class="hint">No games yet</p>'}`,
-      () => { ui.me = isMe ? null : id; LS.set('gn-me', ui.me); schedule(); }, isMe ? 'Not me' : 'This is me');
+    );
   },
-  tab(id){ ui.tab = id; if (id === 'setup') ui.ev = null; saveDraft(); render(); },
-  async logout(){ await store.signOut(); },
+  tab(id){ ui.tab = id; if (id === 'setup'){ ui.ev = null; ui.ticketsText = null; } saveDraft(); render(); },
+  async logout(){ resetJoin(); await store.signOut(); },
   toggle(arg){
     const [gid, pid, max] = arg.split('|'), st = stOf(gid), m = +max;
     if (st.sel.includes(pid)) st.sel = st.sel.filter(x => x !== pid);
@@ -489,6 +533,32 @@ const ACT = {
     }, 'Undone'));
   },
   gedit(id){ gameEditor(id || null); },
+  async google(){
+    // demo has no Google, so ask for an email to pretend with
+    if (store.demo){
+      openModal(`<h3>Demo sign-in</h3><p class="hint">Type any email to sign in as that player.</p><input class="minput" id="m-email" type="email" placeholder="name@gmail.com">`, async () => {
+        const e = document.getElementById('m-email').value.trim(); if (!e.includes('@')){ toast('Enter an email'); return true; }
+        resetJoin(); await store.signInGoogle(e);
+      }, 'Sign in');
+      return;
+    }
+    try{ resetJoin(); await store.signInGoogle(); }
+    catch(err){
+      if (err.code === 'auth/popup-closed-by-user' || err.code === 'auth/cancelled-popup-request') return;
+      toast('Sign-in didn’t work. Open this page in Safari or Chrome and try again.');
+    }
+  },
+  savetickets(){
+    const list = parseEmails(ui.ticketsText);
+    ui.ticketsText = list.join('\n');
+    safe(() => store.write({tickets: list.length ? Object.fromEntries(list.map(e => [emailKey(e), true])) : null}), `Ticket list saved (${list.length})`);
+    schedule();
+  },
+  ticket(pid){
+    const c = cfg(), extra = (Number(c.ticketCoins) || 0) - (Number(c.startCoins) || 0);
+    confirmDeltas(`${pname(pid)} bought a ticket`, {[pid]: extra}, 0, () => safe(() =>
+      transact({id: 'adjust', name: 'Adjustment'}, 'Bought a ticket', {[pid]: extra}, {}, {[`players/${pid}/ticket`]: true}), 'Ticket added'));
+  },
   gmove(arg){
     const [id, dir] = arg.split('|');
     saveConfig(c => {
@@ -515,13 +585,14 @@ const ACT = {
 
 async function addPlayers(names){
   const existing = new Set(Object.values(S.players).map(p => String(p.name).toLowerCase()));
-  const upd = {}, skipped = [], start = Number(cfg().startCoins) || 0;
+  const ticket = !!ui.addTicket;
+  const upd = {}, skipped = [], start = Number(ticket ? cfg().ticketCoins : cfg().startCoins) || 0;
   let added = 0;
   for (const raw of names){
     const n = raw.trim().slice(0, 39); if (!n) continue;
     if (existing.has(n.toLowerCase())){ skipped.push(n); continue; }
     existing.add(n.toLowerCase());
-    upd[`players/${store.newId('players')}`] = {name: n, coins: start, created: Date.now()};
+    upd[`players/${store.newId('players')}`] = {name: n, coins: start, created: Date.now(), ...(ticket ? {ticket: true} : {})};
     added++;
   }
   if (added) await safe(() => store.write(upd));
@@ -529,7 +600,22 @@ async function addPlayers(names){
   schedule();
 }
 
+const resetJoin = () => { ui.joinName = null; ui.joinTicket = undefined; ui.joinErr = ''; };
+
 const SUBMIT = {
+  async join(){
+    const name = String(ui.joinName || '').trim().slice(0, 39), c = cfg();
+    if (!user || isHost() || ui.joinTicket === null) return;
+    if (!name){ ui.joinErr = 'Type a name for the leaderboard.'; render(); return; }
+    if (Object.entries(S.players).some(([id, p]) => id !== user.uid && String(p.name).toLowerCase() === name.toLowerCase())){
+      ui.joinErr = 'Someone already has that name. Try adding an initial.'; render(); return;
+    }
+    const t = !!ui.joinTicket;
+    try{
+      await store.write({[`players/${user.uid}`]: {name, coins: Number(t ? c.ticketCoins : c.startCoins), created: Date.now(), uid: user.uid, ...(t ? {ticket: true} : {})}});
+      ui.joinErr = ''; toast('You’re in');
+    }catch(err){ console.error(err); ui.joinErr = 'Couldn’t join. Ask a host to check the setup.'; render(); }
+  },
   async login(){
     const e = document.getElementById('lemail').value.trim(), p = document.getElementById('lpw').value;
     try{ ui.loginErr = ''; await store.signIn(e, p); }
@@ -537,10 +623,10 @@ const SUBMIT = {
   },
   addone(){ const n = ui.newName; ui.newName = ''; addPlayers([n]); document.getElementById('newname')?.focus(); },
   eventform(){
-    const e = ui.ev, start = parseInt(e.startCoins, 10);
+    const e = ui.ev, start = parseInt(e.startCoins, 10), tstart = parseInt(e.ticketCoins, 10);
     if (!e.title.trim()){ toast('Title can’t be empty'); return; }
-    if (!(start >= 0)){ toast('Starting coins must be 0 or more'); return; }
-    saveConfig(c => Object.assign(c, {title: e.title.trim().slice(0, 40), subtitle: e.subtitle.trim().slice(0, 40), startCoins: start, brokePolicy: e.brokePolicy}), 'Settings saved');
+    if (!(start >= 0) || !(tstart >= 0)){ toast('Starting coins must be 0 or more'); return; }
+    saveConfig(c => Object.assign(c, {title: e.title.trim().slice(0, 40), subtitle: e.subtitle.trim().slice(0, 40), startCoins: start, ticketCoins: tstart, brokePolicy: e.brokePolicy}), 'Settings saved');
   },
 };
 
@@ -552,7 +638,7 @@ document.addEventListener('click', e => {
 });
 document.addEventListener('input', e => {
   const k = e.target.dataset?.bind; if (!k) return;
-  setPath(ui, k, e.target.value);
+  setPath(ui, k, e.target.type === 'checkbox' ? e.target.checked : e.target.value);
   if (k.startsWith('st.')) saveDraft();
   if ('live' in e.target.dataset) render();
 });
@@ -560,11 +646,21 @@ document.addEventListener('change', e => { if (e.target.id === 'm-kind') syncKin
 document.addEventListener('submit', e => { e.preventDefault(); SUBMIT[e.target.id]?.(); });
 window.addEventListener('hashchange', render);
 
+// the join rule reads the coin amounts from config, so make sure a host has saved them
+let seeding = false;
+function seedConfig(){
+  if (seeding || !loaded || !isHost()) return;
+  const c = S.config;
+  if (c && c.games && c.startCoins != null && c.ticketCoins != null) return;
+  seeding = true;
+  saveConfig(() => {}).finally(() => { seeding = false; });
+}
+
 // ===== start =====
 render();
 (async () => {
   try{ store = FIREBASE_CONFIG ? await firebaseStore(FIREBASE_CONFIG) : localStore(); }
   catch(err){ $app.innerHTML = `<div class="warn">Couldn’t connect to Firebase: ${esc(err.message)}</div>`; return; }
-  store.onAuth(u => { user = u; schedule(); });
-  store.onData(s => { S = s; loaded = true; schedule(); });
+  store.onAuth(u => { user = u; schedule(); seedConfig(); });
+  store.onData(s => { S = s; loaded = true; schedule(); seedConfig(); });
 })();
